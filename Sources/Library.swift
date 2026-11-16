@@ -67,6 +67,22 @@ final class Library: ObservableObject {
         return img
     }
 
+    /// Decode a thumbnail off the main thread; cached results come back immediately.
+    func thumbnail(_ url: URL, completion: @escaping (NSImage?) -> Void) {
+        let key = url.path + "\(modified(url).timeIntervalSince1970)"
+        if let t = thumbCache[key] { completion(t); return }
+        DispatchQueue.global(qos: .userInitiated).async {
+            var img: NSImage?
+            if let src = CGImageSourceCreateWithURL(url as CFURL, nil),
+               let cg = CGImageSourceCreateThumbnailAtIndex(src, 0, [kCGImageSourceCreateThumbnailFromImageAlways: true,
+                                                                     kCGImageSourceThumbnailMaxPixelSize: 260,
+                                                                     kCGImageSourceCreateThumbnailWithTransform: true] as CFDictionary) {
+                img = NSImage(cgImage: cg, size: NSSize(width: cg.width, height: cg.height))
+            }
+            DispatchQueue.main.async { if let img { self.thumbCache[key] = img }; completion(img) }
+        }
+    }
+
     func pixelSize(_ url: URL) -> String {
         guard let src = CGImageSourceCreateWithURL(url as CFURL, nil),
               let p = CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [CFString: Any],

@@ -87,60 +87,73 @@ final class CaptureSession {
 
     @MainActor
     private func freezeAndShow() async {
-        PermissionState.shared.refresh()
-        if !PermissionState.shared.screenReady {
-            end()
-            PermissionsController.shared.show(.screen)
-            return
+        let screens = NSScreen.screens
+        func target(_ s: NSScreen) -> ScreenGrab.Target {
+            ScreenGrab.Target(id: Geo.displayID(s), pixels: CGSize(width: s.frame.width * s.backingScaleFactor, height: s.frame.height * s.backingScaleFactor))
         }
-        windows = Self.loadWindows()
-        do {
-            let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
-            var jobs: [(CGDirectDisplayID, SCContentFilter, SCStreamConfiguration)] = []
-            for screen in NSScreen.screens {
-                let id = Geo.displayID(screen)
-                guard let d = content.displays.first(where: { $0.displayID == id }) else { continue }
-                let cfg = SCStreamConfiguration()
-                cfg.width = Int(screen.frame.width * screen.backingScaleFactor)
-                cfg.height = Int(screen.frame.height * screen.backingScaleFactor)
-                cfg.showsCursor = false
-                cfg.captureResolution = .best
-                jobs.append((id, SCContentFilter(display: d, excludingWindows: []), cfg))
-            }
-            // All displays at once.
-            try await withThrowingTaskGroup(of: (CGDirectDisplayID, CGImage).self) { group in
-                for (id, filter, cfg) in jobs {
-                    group.addTask { (id, try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: cfg)) }
-                }
-                for try await (id, img) in group { shots[id] = img }
-            }
-        } catch {
-            NSLog("Snapmark capture error: \(error)")
-            end()
-            PermissionsController.shared.show(.screen)
-            return
-        }
+        // The screen under the cursor is grabbed first and shown as soon as it's ready; the others follow.
+        let main = Geo.screen(at: cursor?.location ?? Geo.mouse()) ?? screens[0]
+        let mainT = target(main)
+        let first = Task.detached(priority: .userInitiated) { try await ScreenGrab.grab(mainT) }
+        let winList = Task.detached(priority: .userInitiated) { CaptureSession.loadWindows() }
 
         if kind == .fullscreen {
-            let p = cursor?.location ?? Geo.mouse()
-            if let s = Geo.screen(at: p) { selection = Geo.cgRect(s); selectionScreen = s; finish(.edit) } else { end() }
+            guard let img = try? await first.value else { failed(); return }
+            shots[mainT.id] = img
+            selection = Geo.cgRect(main); selectionScreen = main
+            finish(.edit)
             return
         }
 
-        for screen in NSScreen.screens {
-            guard let shot = shots[Geo.displayID(screen)] else { continue }
-            let v = OverlayView(session: self, screen: screen, shot: shot)
-            let w = OverlayWindow(screen: screen, view: v)
+        for screen in screens {
+            let v = OverlayView(session: self, screen: screen)
+            let w = OverlayWindow.reuse(screen: screen)
+            w.install(v)
             overlays.append(w); views.append(v)
         }
+        guard let img = try? await first.value else { failed(); return }
+        guard !ended else { return }
+        shots[mainT.id] = img
+        windows = await winList.value
+        show(on: main)
         NSApp.activate(ignoringOtherApps: true)
-        for w in overlays { w.orderFrontRegardless() }
         mouse = Geo.mouse()
-        let keyWin = overlays.first { $0.frame.contains(NSEvent.mouseLocation) } ?? overlays.first
-        keyWin?.makeKeyAndOrderFront(nil)
-        if let kv = keyWin?.contentView?.subviews.first { keyWin?.makeFirstResponder(kv) }
+        if let w = overlays.first(where: { ($0.contentView?.subviews.last as? OverlayView)?.screen == main }) {
+            w.makeKeyAndOrderFront(nil)
+            if let kv = w.contentView?.subviews.last { w.makeFirstResponder(kv) }
+        }
         NSCursor.crosshair.set()
         updateHover()
+        overlays.forEach { $0.displayIfNeeded() }
+        CATransaction.flush()
+        let ms = Perf.end("hotkey → overlay visible", log: !Bench.active)
+        if Bench.active { Bench.record("hotkey → overlay visible", ms) }
+
+        for screen in screens where screen != main {
+            let t = target(screen)
+            Task.detached(priority: .userInitiated) {
+                let img = try? await ScreenGrab.grab(t)
+                await MainActor.run { [weak self] in
+                    guard let self, !self.ended, let img else { return }
+                    self.shots[t.id] = img
+                    self.show(on: screen)
+                    self.redraw()
+                }
+            }
+        }
+        if Bench.active { DispatchQueue.main.async { Bench.onOverlay?() } }
+    }
+
+    private func show(on screen: NSScreen) {
+        guard let i = views.firstIndex(where: { $0.screen == screen }) else { return }
+        views[i].shot = shots[Geo.displayID(screen)]
+        overlays[i].showShot(views[i].shot)
+        overlays[i].orderFrontRegardless()
+    }
+
+    private func failed() {
+        end()
+        PermissionsController.shared.show(.screen)
     }
 
     static func loadWindows() -> [WinInfo] {
@@ -376,6 +389,8 @@ final class CaptureSession {
             if case .adjusting = phase { finish(.copy) }
         case 17 where !cmd: // T: grab text
             if case .adjusting = phase { finish(.text) } else { return false }
+        case 1 where !cmd: // S: scrolling capture
+            if case .adjusting = phase { finish(.scroll) } else { return false }
         case 35 where !cmd: // P: pin
             if case .adjusting = phase { finish(.pin) } else { return false }
         default:
@@ -441,7 +456,7 @@ final class CaptureSession {
 
     // MARK: Finish
 
-    enum Action { case edit, copy, text, pin }
+    enum Action { case edit, copy, text, pin, scroll }
 
     func finish(_ action: Action) {
         guard let screen = selectionScreen ?? Geo.screen(at: selection.origin),
@@ -451,9 +466,23 @@ final class CaptureSession {
         let local = selection.offsetBy(dx: -sf.minX, dy: -sf.minY)
         let px = CGRect(x: local.minX * scale, y: local.minY * scale, width: local.width * scale, height: local.height * scale)
             .integral.intersection(CGRect(x: 0, y: 0, width: shot.width, height: shot.height))
-        guard px.width >= 2, px.height >= 2, let img = shot.cropping(to: px) else { cancel(); return }
+        guard px.width >= 2, px.height >= 2, let crop = shot.cropping(to: px) else { cancel(); return }
+        // Copy the pixels out so the full-screen grabs can be freed right away (and drawing never touches them).
+        let img: CGImage = {
+            guard let ctx = CGContext(data: nil, width: crop.width, height: crop.height, bitsPerComponent: 8, bytesPerRow: 0,
+                                      space: crop.colorSpace ?? CGColorSpaceCreateDeviceRGB(),
+                                      bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue) else { return crop }
+            ctx.draw(crop, in: CGRect(x: 0, y: 0, width: crop.width, height: crop.height))
+            return ctx.makeImage() ?? crop
+        }()
         let origin = CGPoint(x: px.minX / scale + sf.minX, y: px.minY / scale + sf.minY)
         let captured = CGRect(origin: origin, size: CGSize(width: px.width / scale, height: px.height / scale))
+
+        if action == .scroll {
+            end()
+            MainActor.assumeIsolated { ScrollCapture.start(rect: captured, screen: screen, scale: scale, first: img) }
+            return
+        }
 
         var extras: [Annotation] = []
         if let c = cursor, captured.contains(c.location) {
@@ -466,7 +495,7 @@ final class CaptureSession {
 
         let prev = previousApp
         end()
-        NSSound(named: "Tink")?.play()
+        ScreenGrab.playShutter()
 
         // Grab Text doesn't need a file.
         if action == .text {
@@ -483,7 +512,8 @@ final class CaptureSession {
         }
 
         // Save to the library in the background; the editor works from the in-memory image right away.
-        let url = Library.shared.newURL()
+        let url = Bench.active ? FileManager.default.temporaryDirectory.appendingPathComponent("bench.png") : Library.shared.newURL()
+        if !Bench.active { Perf.start("capture → editor visible") }
         DispatchQueue.global(qos: .utility).async {
             Renderer.write(img, to: url, type: .png, scale: scale)
             DispatchQueue.main.async { Library.shared.reload() }
@@ -501,9 +531,67 @@ final class CaptureSession {
             let topLeft = NSPoint(x: captured.minX, y: Geo.primaryHeight - captured.minY)
             PinWindow.show(NSImage(cgImage: img, size: captured.size), near: topLeft)
             prev?.activate()
-        case .text:
+        case .text, .scroll:
             break
         }
+    }
+
+    /// Debug: render the capture screen over a given image, with a selection and the toolbar, to a PNG.
+    static func snapshot(input: URL, output: URL) {
+        guard let src = CGImageSourceCreateWithURL(input as CFURL, nil), let img = CGImageSourceCreateImageAtIndex(src, 0, nil),
+              let screen = NSScreen.main else { return }
+        let s = CaptureSession(kind: .smart)
+        let v = OverlayView(session: s, screen: screen)
+        let w = OverlayWindow(screen: screen)
+        w.install(v)
+        s.views = [v]; s.overlays = [w]
+        let sf = Geo.cgRect(screen)
+        let scaled: CGImage? = {
+            let W = Int(sf.width * screen.backingScaleFactor), H = Int(sf.height * screen.backingScaleFactor)
+            guard let ctx = CGContext(data: nil, width: W, height: H, bitsPerComponent: 8, bytesPerRow: 0, space: CGColorSpaceCreateDeviceRGB(),
+                                      bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue) else { return nil }
+            ctx.draw(img, in: CGRect(x: 0, y: 0, width: W, height: H)); return ctx.makeImage()
+        }()
+        v.shot = scaled; w.showShot(scaled)
+        // Hover state with the loupe, then the adjusting state with the toolbar.
+        s.mouse = CGPoint(x: sf.minX + sf.width * 0.3, y: sf.minY + sf.height * 0.3)
+        s.hoverStack = [CGRect(x: sf.minX + sf.width * 0.2, y: sf.minY + sf.height * 0.2, width: sf.width * 0.3, height: sf.height * 0.25)]
+        s.hoverLabel = "Safari"
+        v.updateLayers()
+        func dump(_ out: URL) {
+            guard let root = w.contentView, let layer = root.layer else { return }
+            root.layoutSubtreeIfNeeded()
+            let W = Int(root.bounds.width * screen.backingScaleFactor), H = Int(root.bounds.height * screen.backingScaleFactor)
+            guard let ctx = CGContext(data: nil, width: W, height: H, bitsPerComponent: 8, bytesPerRow: 0, space: CGColorSpaceCreateDeviceRGB(),
+                                      bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue) else { return }
+            ctx.scaleBy(x: screen.backingScaleFactor, y: screen.backingScaleFactor)
+            layer.render(in: ctx)
+            if let cg = ctx.makeImage(), let d = CGImageDestinationCreateWithURL(out as CFURL, "public.png" as CFString, 1, nil) {
+                CGImageDestinationAddImage(d, cg, nil); CGImageDestinationFinalize(d)
+            }
+        }
+        w.orderBack(nil); w.alphaValue = 0.01
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
+            dump(output.deletingPathExtension().appendingPathExtension("hover.png"))
+            s.selectionScreen = screen
+            s.selection = CGRect(x: sf.minX + sf.width * 0.25, y: sf.minY + sf.height * 0.22, width: sf.width * 0.4, height: sf.height * 0.4)
+            s.phase = .adjusting
+            v.showToolbar()
+            v.updateLayers()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { dump(output); exit(0) }
+        }
+    }
+
+    /// Typed into the toolbar's W × H fields (points shown as pixels).
+    func applySize(width: CGFloat, height: CGFloat) {
+        guard case .adjusting = phase else { return }
+        selection.size = CGSize(width: max(4, width), height: max(4, height))
+        if let sf = selectionScreen.map(Geo.cgRect) {
+            selection.origin.x = min(selection.minX, sf.maxX - selection.width)
+            selection.origin.y = min(selection.minY, sf.maxY - selection.height)
+        }
+        selection = clip(selection)
+        positionToolbar(); redraw()
     }
 
     func reselect() {
@@ -518,9 +606,14 @@ final class CaptureSession {
         if AppDelegate.shared.editorHiddenForCapture { AppDelegate.shared.captureCancelled() } else { prev?.activate() }
     }
 
+    private(set) var ended = false
     private func end() {
-        overlays.forEach { $0.orderOut(nil) }
+        ended = true
+        overlays.forEach { $0.alphaValue = 0; $0.ignoresMouseEvents = true }
+        let old = overlays
+        DispatchQueue.main.async { old.forEach { $0.orderOut(nil); $0.contentView = nil } }
         overlays.removeAll(); views.removeAll()
+        ScreenGrab.refreshContent()
         CaptureSession.current = nil
         NSCursor.arrow.set()
     }
@@ -529,7 +622,19 @@ final class CaptureSession {
 // MARK: - Overlay window & view (GPU-composited: every mouse move only updates layer paths/positions)
 
 final class OverlayWindow: NSWindow {
-    init(screen: NSScreen, view: OverlayView) {
+    /// Windows are kept between captures: creating a full-screen window costs ~50-100 ms of WindowServer time.
+    static var pool: [CGDirectDisplayID: OverlayWindow] = [:]
+    static func reuse(screen: NSScreen) -> OverlayWindow {
+        let id = Geo.displayID(screen)
+        if let w = pool[id], w.frame == screen.frame { return w }
+        let w = OverlayWindow(screen: screen)
+        pool[id] = w
+        return w
+    }
+
+    private var container: NSView?
+
+    init(screen: NSScreen) {
         super.init(contentRect: NSRect(origin: .zero, size: screen.frame.size), styleMask: .borderless, backing: .buffered, defer: false)
         setFrame(screen.frame, display: false)
         level = .screenSaver
@@ -539,54 +644,62 @@ final class OverlayWindow: NSWindow {
         isReleasedWhenClosed = false
         animationBehavior = .none
         collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary, .ignoresCycle]
+    }
 
+    func install(_ view: OverlayView) {
+        alphaValue = 1
+        ignoresMouseEvents = false
         // Frozen screenshot as the window's backing layer; overlay layers sit above it.
-        let container = NSView(frame: NSRect(origin: .zero, size: screen.frame.size))
-        container.wantsLayer = true
-        container.layer?.contents = view.shot
-        container.layer?.contentsGravity = .resize
-        let host = NSView(frame: container.bounds)
+        let c = NSView(frame: NSRect(origin: .zero, size: frame.size))
+        c.wantsLayer = true
+        c.layer?.contentsGravity = .resize
+        c.layer?.actions = ["contents": NSNull()]
+        let host = NSView(frame: c.bounds)
         host.wantsLayer = true
         host.autoresizingMask = [.width, .height]
-        container.addSubview(host)
-        view.frame = container.bounds
+        c.addSubview(host)
+        view.frame = c.bounds
         view.autoresizingMask = [.width, .height]
-        container.addSubview(view)
+        c.addSubview(view)
         view.attach(layerHost: host)
-        contentView = container
+        contentView = c
+        container = c
     }
+
+    func showShot(_ img: CGImage?) { container?.layer?.contents = img }
     override var canBecomeKey: Bool { true }
     override var canBecomeMain: Bool { true }
 }
 
-final class OverlayView: NSView {
-    unowned let session: CaptureSession
+final class OverlayView: NSView, NSTextFieldDelegate {
+    let session: CaptureSession
     let screen: NSScreen
-    let shot: CGImage
+    var shot: CGImage?
     let cgFrame: CGRect
     let scale: CGFloat
     var toolbar: NSView?
 
-    // Layers (in the unflipped host's coordinates).
-    private let dim = CAShapeLayer()
-    private let border = CAShapeLayer()
-    private let handles = CAShapeLayer()
+    // Everything is a plain CALayer (GPU-composited) or a small shape layer; nothing full-screen is redrawn on the CPU.
+    private let dims = (0..<4).map { _ in CALayer() }          // top, bottom, left, right
+    private let edges = (0..<4).map { _ in CAShapeLayer() }    // dashed / solid outline, one thin layer per side
+    private let handles = (0..<8).map { _ in CALayer() }
     private let hLine = CALayer()
     private let vLine = CALayer()
     private let label = CALayer()
     private let hint = CALayer()
     private let loupe = CALayer()
     private let loupeImage = CALayer()
-    private let loupeMarks = CAShapeLayer()
+    private let loupeGrid = CAShapeLayer()
     private let loupeInfo = CALayer()
+    private let swatch = CALayer()
     private var labelText = "", infoText = ""
+    private var wField: NSTextField?, hField: NSTextField?
 
-    init(session: CaptureSession, screen: NSScreen, shot: CGImage) {
+    init(session: CaptureSession, screen: NSScreen) {
         self.session = session
         self.screen = screen
-        self.shot = shot
         self.cgFrame = Geo.cgRect(screen)
-        self.scale = CGFloat(shot.width) / screen.frame.width
+        self.scale = screen.backingScaleFactor
         super.init(frame: NSRect(origin: .zero, size: screen.frame.size))
     }
     required init?(coder: NSCoder) { fatalError() }
@@ -598,27 +711,36 @@ final class OverlayView: NSView {
     func attach(layerHost host: NSView) {
         guard let root = host.layer else { return }
         let ac = accent.cgColor
-        dim.fillRule = .evenOdd
-        border.fillColor = nil; border.strokeColor = ac
-        handles.fillColor = NSColor.white.cgColor; handles.strokeColor = ac; handles.lineWidth = 2
-        hLine.backgroundColor = accent.withAlphaComponent(0.75).cgColor
-        vLine.backgroundColor = accent.withAlphaComponent(0.75).cgColor
-        loupe.cornerRadius = 10; loupe.masksToBounds = true
+        let noAnim: [String: any CAAction] = ["position": NSNull(), "bounds": NSNull(), "path": NSNull(), "contents": NSNull(),
+                                             "hidden": NSNull(), "frame": NSNull(), "backgroundColor": NSNull(), "lineDashPattern": NSNull()]
+        for d in dims { d.backgroundColor = NSColor.black.withAlphaComponent(0.4).cgColor }
+        for e in edges { e.strokeColor = ac; e.fillColor = nil }
+        for h in handles {
+            h.backgroundColor = NSColor.white.cgColor
+            h.borderColor = ac; h.borderWidth = 1.5
+            h.bounds = CGRect(x: 0, y: 0, width: 9, height: 9)
+            h.shadowOpacity = 0.35; h.shadowRadius = 1.5; h.shadowOffset = .zero
+        }
+        hLine.backgroundColor = accent.withAlphaComponent(0.85).cgColor
+        vLine.backgroundColor = accent.withAlphaComponent(0.85).cgColor
+        loupe.cornerRadius = 62; loupe.masksToBounds = true
         loupe.borderColor = NSColor.white.cgColor; loupe.borderWidth = 3
         loupe.backgroundColor = NSColor.black.cgColor
         loupeImage.magnificationFilter = .nearest
         loupe.addSublayer(loupeImage)
-        loupeMarks.fillColor = accent.withAlphaComponent(0.35).cgColor
-        loupeMarks.strokeColor = NSColor.white.cgColor; loupeMarks.lineWidth = 1
-        loupe.addSublayer(loupeMarks)
-        for l in [dim, border, handles, hLine, vLine, label, hint, loupe, loupeInfo] as [CALayer] {
+        loupeGrid.strokeColor = accent.cgColor; loupeGrid.fillColor = nil; loupeGrid.lineWidth = 1.5
+        loupe.addSublayer(loupeGrid)
+        swatch.cornerRadius = 3; swatch.borderColor = NSColor.white.cgColor; swatch.borderWidth = 1
+        let all: [CALayer] = dims + edges + handles + [hLine, vLine, label, hint, loupe, loupeInfo, swatch]
+        for l in all {
             l.contentsScale = scale
-            l.actions = ["position": NSNull(), "bounds": NSNull(), "path": NSNull(), "contents": NSNull(), "hidden": NSNull(), "frame": NSNull()]
+            l.actions = noAnim
             root.addSublayer(l)
         }
+        for l in [loupeImage, loupeGrid] as [CALayer] { l.actions = noAnim }
         let tip = session.kind == .window
             ? "Click a window to capture it   ·   Esc to cancel"
-            : "Click to capture the highlighted area, or drag to select a region   ·   Esc to cancel"
+            : "Click to capture the highlighted area, or drag to select   ·   scroll to pick a bigger area   ·   Esc to cancel"
         if let (img, sz) = OverlayView.pill(tip, font: .systemFont(ofSize: 13, weight: .medium), bg: NSColor.black.withAlphaComponent(0.72), scale: scale, radius: 14, padX: 14, padY: 6) {
             hint.contents = img
             hint.frame = CGRect(x: (bounds.width - sz.width) / 2, y: 52, width: sz.width, height: sz.height)
@@ -642,15 +764,18 @@ final class OverlayView: NSView {
     private func setCursor() {
         if case .adjusting = session.phase { NSCursor.arrow.set() } else { NSCursor.crosshair.set() }
     }
-    override func mouseEntered(with event: NSEvent) { window?.makeKey(); window?.makeFirstResponder(self); setCursor() }
-    override func mouseMoved(with e: NSEvent) { setCursor(); session.mouseMoved(g(e)) }
-    override func mouseDown(with e: NSEvent) { session.mouseDown(g(e), clickCount: e.clickCount) }
-    override func mouseDragged(with e: NSEvent) { session.mouseDragged(g(e)) }
-    override func mouseUp(with e: NSEvent) { session.mouseUp(g(e)) }
-    override func rightMouseDown(with event: NSEvent) { session.cancel() }
-    override func scrollWheel(with e: NSEvent) { session.scroll(e) }
-    override func keyDown(with e: NSEvent) { if !session.keyDown(e) { super.keyDown(with: e) } }
-    override func performKeyEquivalent(with e: NSEvent) -> Bool { session.keyDown(e) }
+    override func mouseEntered(with event: NSEvent) { guard !session.ended else { return }; window?.makeKey(); if !(window?.firstResponder is NSTextView) { window?.makeFirstResponder(self) }; setCursor() }
+    override func mouseMoved(with e: NSEvent) { guard !session.ended else { return }; setCursor(); session.mouseMoved(g(e)) }
+    override func mouseDown(with e: NSEvent) { guard !session.ended else { return }; window?.makeFirstResponder(self); session.mouseDown(g(e), clickCount: e.clickCount) }
+    override func mouseDragged(with e: NSEvent) { guard !session.ended else { return }; session.mouseDragged(g(e)) }
+    override func mouseUp(with e: NSEvent) { guard !session.ended else { return }; session.mouseUp(g(e)) }
+    override func rightMouseDown(with event: NSEvent) { guard !session.ended else { return }; session.cancel() }
+    override func scrollWheel(with e: NSEvent) { guard !session.ended else { return }; session.scroll(e) }
+    override func keyDown(with e: NSEvent) { guard !session.ended else { return }; if !session.keyDown(e) { super.keyDown(with: e) } }
+    override func performKeyEquivalent(with e: NSEvent) -> Bool {
+        guard !session.ended, !(window?.firstResponder is NSTextView) else { return false }
+        return session.keyDown(e)
+    }
 
     // MARK: Layer updates
 
@@ -669,97 +794,119 @@ final class OverlayView: NSView {
         let hovering: Bool = { if case .hover = session.phase { return true }; return false }()
         let onThisScreen = cgFrame.contains(session.mouse)
 
-        // Dim + border
-        let path = CGMutablePath()
-        path.addRect(bounds)
-        let f = focus.map(local)
-        if let f, f.intersects(bounds) { path.addRect(fy(f)) }
-        dim.path = path
-        dim.fillColor = NSColor.black.withAlphaComponent(isSelection ? 0.45 : 0.32).cgColor
-        if let f, f.intersects(bounds) {
-            border.isHidden = false
-            border.lineWidth = isSelection ? 2 : 3
-            border.path = CGPath(rect: fy(f.insetBy(dx: -1, dy: -1)), transform: nil)
+        // Dim everything except the focus rect, using four solid layers around it.
+        let f = focus.map(local).flatMap { $0.intersects(bounds) ? $0.intersection(bounds) : nil }
+        let dimAlpha: CGFloat = isSelection ? 0.5 : 0.35
+        for d in dims { d.backgroundColor = NSColor.black.withAlphaComponent(dimAlpha).cgColor }
+        if let f {
+            dims[0].frame = fy(CGRect(x: 0, y: 0, width: bounds.width, height: f.minY))
+            dims[1].frame = fy(CGRect(x: 0, y: f.maxY, width: bounds.width, height: bounds.height - f.maxY))
+            dims[2].frame = fy(CGRect(x: 0, y: f.minY, width: f.minX, height: f.height))
+            dims[3].frame = fy(CGRect(x: f.maxX, y: f.minY, width: bounds.width - f.maxX, height: f.height))
+        } else {
+            dims[0].frame = fy(bounds)
+            for d in dims.dropFirst() { d.frame = .zero }
+        }
+
+        // Outline: dashed while hovering (like a marquee), solid once selected.
+        if let f {
+            let lw: CGFloat = isSelection ? 1.5 : 2.5
+            let r = f.insetBy(dx: -lw / 2, dy: -lw / 2)
+            let sides: [(CGPoint, CGPoint)] = [
+                (CGPoint(x: r.minX, y: r.minY), CGPoint(x: r.maxX, y: r.minY)), (CGPoint(x: r.minX, y: r.maxY), CGPoint(x: r.maxX, y: r.maxY)),
+                (CGPoint(x: r.minX, y: r.minY), CGPoint(x: r.minX, y: r.maxY)), (CGPoint(x: r.maxX, y: r.minY), CGPoint(x: r.maxX, y: r.maxY)),
+            ]
+            for (e, (a, b)) in zip(edges, sides) {
+                let box = fy(CGRect(x: min(a.x, b.x) - lw, y: min(a.y, b.y) - lw, width: abs(b.x - a.x) + lw * 2, height: abs(b.y - a.y) + lw * 2))
+                e.frame = box
+                let p = CGMutablePath()
+                let fa = fy(CGRect(origin: a, size: .zero)).origin, fb = fy(CGRect(origin: b, size: .zero)).origin
+                p.move(to: CGPoint(x: fa.x - box.minX, y: fa.y - box.minY)); p.addLine(to: CGPoint(x: fb.x - box.minX, y: fb.y - box.minY))
+                e.path = p
+                e.lineWidth = lw
+                e.lineDashPattern = isSelection ? nil : [7, 4]
+                e.isHidden = false
+            }
 
             let px = "\(Int((f.width * scale).rounded())) × \(Int((f.height * scale).rounded()))"
             var text = px
-            if !isSelection, !session.hoverLabel.isEmpty {
-                text = session.hoverLabel + "   " + px
-                if session.hoverStack.count > 1 { text += "   ⇅ scroll" }
-            }
+            if !isSelection, !session.hoverLabel.isEmpty { text = session.hoverLabel + "   " + px }
             setPill(label, text: text, cache: &labelText, font: .monospacedDigitSystemFont(ofSize: 12, weight: .semibold), bg: accent)
             var lr = CGRect(origin: CGPoint(x: f.minX, y: f.minY - 26 >= 4 ? f.minY - 26 : f.minY + 6), size: label.bounds.size)
             lr.origin.x = min(max(4, lr.minX), bounds.maxX - lr.width - 4)
             label.frame = fy(lr)
-            label.isHidden = false
+            label.isHidden = adjusting   // the toolbar shows the size once a region is selected
         } else {
-            border.isHidden = true
+            edges.forEach { $0.isHidden = true }
             label.isHidden = true
         }
 
-        // Handles
+        // Square handles on corners and edges.
         if adjusting, let f {
-            let hp = CGMutablePath()
-            for p in session.handlePoints(f) { hp.addEllipse(in: fy(CGRect(x: p.x - 5, y: p.y - 5, width: 10, height: 10))) }
-            handles.path = hp
-            handles.isHidden = false
+            for (h, p) in zip(handles, session.handlePoints(f)) { h.position = fy(CGRect(origin: p, size: .zero)).origin; h.isHidden = false }
         } else {
-            handles.isHidden = true
+            handles.forEach { $0.isHidden = true }
         }
 
-        // Crosshair + loupe
+        // Full-screen crosshair + magnifier
         let showCross = onThisScreen && !adjusting
         hLine.isHidden = !showCross; vLine.isHidden = !showCross
-        loupe.isHidden = !showCross; loupeInfo.isHidden = !showCross
+        loupe.isHidden = !showCross || shot == nil; loupeInfo.isHidden = loupe.isHidden; swatch.isHidden = loupe.isHidden
         hint.isHidden = !(hovering && onThisScreen)
         if showCross {
             let m = local(session.mouse)
             hLine.frame = fy(CGRect(x: 0, y: m.y.rounded(.down), width: bounds.width, height: 1))
             vLine.frame = fy(CGRect(x: m.x.rounded(.down), y: 0, width: 1, height: bounds.height))
-            updateLoupe(at: m)
+            if shot != nil { updateLoupe(at: m) }
         }
+        if adjusting { syncSizeFields() }
     }
 
     private func updateLoupe(at m: CGPoint) {
-        let span: CGFloat = 15, L: CGFloat = 124
+        guard let shot else { return }
+        let span: CGFloat = 13, L: CGFloat = 124
         let want = CGRect(x: (m.x - span / 2) * scale, y: (m.y - span / 2) * scale, width: span * scale, height: span * scale).integral
-        var o = CGPoint(x: m.x + 22, y: m.y + 22)
-        if o.x + L > bounds.maxX - 6 { o.x = m.x - 22 - L }
-        if o.y + L + 30 > bounds.maxY - 6 { o.y = m.y - 22 - L - 30 }
+        var o = CGPoint(x: m.x + 26, y: m.y + 26)
+        if o.x + L > bounds.maxX - 6 { o.x = m.x - 26 - L }
+        if o.y + L + 34 > bounds.maxY - 6 { o.y = m.y - 26 - L - 34 }
         let box = CGRect(origin: o, size: CGSize(width: L, height: L))
         loupe.frame = fy(box)
 
         let pxSize = L / (span * scale)
+        var hex = ""
         if let crop = shot.cropping(to: want) {
-            // Keep pixels aligned when the crop is clipped at a screen edge.
             let got = want.intersection(CGRect(x: 0, y: 0, width: shot.width, height: shot.height))
             let dst = CGRect(x: (got.minX - want.minX) * pxSize, y: (got.minY - want.minY) * pxSize,
                              width: CGFloat(crop.width) * pxSize, height: CGFloat(crop.height) * pxSize)
             loupeImage.contents = crop
             loupeImage.frame = CGRect(x: dst.minX, y: L - dst.maxY, width: dst.width, height: dst.height)
         }
-        if loupeMarks.path == nil {
+        // Color of the pixel under the cursor.
+        let cp = CGRect(x: (m.x * scale).rounded(.down), y: (m.y * scale).rounded(.down), width: 1, height: 1)
+        if let one = shot.cropping(to: cp) {
+            var d = [UInt8](repeating: 0, count: 4)
+            if let ctx = CGContext(data: &d, width: 1, height: 1, bitsPerComponent: 8, bytesPerRow: 4, space: CGColorSpaceCreateDeviceRGB(),
+                                   bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) {
+                ctx.draw(one, in: CGRect(x: 0, y: 0, width: 1, height: 1))
+                hex = String(format: "#%02X%02X%02X", d[0], d[1], d[2])
+                swatch.backgroundColor = CGColor(red: CGFloat(d[0]) / 255, green: CGFloat(d[1]) / 255, blue: CGFloat(d[2]) / 255, alpha: 1)
+            }
+        }
+        if loupeGrid.path == nil {
             let c = CGRect(x: L / 2 - pxSize / 2, y: L / 2 - pxSize / 2, width: pxSize, height: pxSize)
-            let p = CGMutablePath()
-            p.addRect(CGRect(x: 0, y: c.minY, width: c.minX, height: pxSize))
-            p.addRect(CGRect(x: c.maxX, y: c.minY, width: L - c.maxX, height: pxSize))
-            p.addRect(CGRect(x: c.minX, y: 0, width: pxSize, height: c.minY))
-            p.addRect(CGRect(x: c.minX, y: c.maxY, width: pxSize, height: L - c.maxY))
-            loupeMarks.frame = CGRect(x: 0, y: 0, width: L, height: L)
-            loupeMarks.path = p
-            let center = CAShapeLayer()
-            center.path = CGPath(rect: c, transform: nil)
-            center.fillColor = nil; center.strokeColor = NSColor.white.cgColor; center.lineWidth = 1
-            loupeMarks.addSublayer(center)
+            loupeGrid.frame = CGRect(x: 0, y: 0, width: L, height: L)
+            loupeGrid.path = CGPath(rect: c, transform: nil)
         }
 
-        var info = "\(Int(m.x * scale)), \(Int(m.y * scale))"
+        var info = "\(Int(m.x * scale)), \(Int(m.y * scale))   \(hex)"
         if case .dragging = session.phase {
             info = "\(Int((session.selection.width * scale).rounded())) × \(Int((session.selection.height * scale).rounded()))"
         }
-        setPill(loupeInfo, text: info, cache: &infoText, font: .monospacedDigitSystemFont(ofSize: 11, weight: .semibold), bg: NSColor.black.withAlphaComponent(0.75))
+        setPill(loupeInfo, text: info, cache: &infoText, font: .monospacedDigitSystemFont(ofSize: 11, weight: .semibold), bg: NSColor.black.withAlphaComponent(0.78))
         let s = loupeInfo.bounds.size
-        loupeInfo.frame = fy(CGRect(x: box.midX - s.width / 2, y: box.maxY + 6, width: s.width, height: s.height))
+        let infoRect = CGRect(x: box.midX - s.width / 2 + 9, y: box.maxY + 8, width: s.width, height: s.height)
+        loupeInfo.frame = fy(infoRect)
+        swatch.frame = fy(CGRect(x: infoRect.minX - 18, y: infoRect.midY - 6, width: 12, height: 12))
     }
 
     private func setPill(_ layer: CALayer, text: String, cache: inout String, font: NSFont, bg: NSColor) {
@@ -789,71 +936,187 @@ final class OverlayView: NSView {
         return (cg, size)
     }
 
-    // MARK: Toolbar (vertical, docked beside the selection)
+    // MARK: Toolbar (horizontal, under the selection)
 
     func showToolbar() {
-        if toolbar == nil {
-            let bg = NSVisualEffectView()
-            bg.material = .hudWindow
-            bg.state = .active
-            bg.blendingMode = .withinWindow
-            bg.wantsLayer = true
-            bg.layer?.cornerRadius = 10
-            bg.appearance = NSAppearance(named: .vibrantDark)
-            func b(_ title: String, _ sym: String, _ sel: Selector, _ tip: String) -> NSButton {
-                let x = NSButton(title: title, image: NSImage(systemSymbolName: sym, accessibilityDescription: title)!, target: self, action: sel)
-                x.imagePosition = .imageLeading
-                x.bezelStyle = .rounded
-                x.controlSize = .large
-                x.toolTip = tip
-                x.alignment = .left
-                x.translatesAutoresizingMaskIntoConstraints = false
-                x.widthAnchor.constraint(equalToConstant: 124).isActive = true
-                return x
-            }
-            let capture = b("Capture", "camera.fill", #selector(doCapture), "Open in the editor (Return or double-click)")
-            capture.bezelColor = accent
-            capture.contentTintColor = .white
-            let stack = NSStackView(views: [
-                capture,
-                b("Copy", "doc.on.doc", #selector(doCopy), "Copy to clipboard, skip the editor (⌘C)"),
-                b("Grab Text", "text.viewfinder", #selector(doText), "Copy the text in this area (T)"),
-                b("Pin", "pin", #selector(doPin), "Float it above all windows (P)"),
-                b("Redo", "arrow.counterclockwise", #selector(doReselect), "Select again (Esc)"),
-                b("Cancel", "xmark", #selector(doCancel), "Cancel capture"),
-            ])
-            stack.orientation = .vertical
-            stack.spacing = 6
-            stack.edgeInsets = NSEdgeInsets(top: 8, left: 8, bottom: 8, right: 8)
-            stack.translatesAutoresizingMaskIntoConstraints = false
-            bg.addSubview(stack)
-            NSLayoutConstraint.activate([
-                stack.leadingAnchor.constraint(equalTo: bg.leadingAnchor), stack.trailingAnchor.constraint(equalTo: bg.trailingAnchor),
-                stack.topAnchor.constraint(equalTo: bg.topAnchor), stack.bottomAnchor.constraint(equalTo: bg.bottomAnchor),
-            ])
-            addSubview(bg)
-            bg.setFrameSize(stack.fittingSize)
-            toolbar = bg
-        }
+        if toolbar == nil { toolbar = makeToolbar() }
         toolbar?.isHidden = false
+        syncSizeFields(force: true)
         positionToolbar()
+    }
+
+    private func makeToolbar() -> NSView {
+        let bg = NSVisualEffectView()
+        bg.material = .hudWindow
+        bg.state = .active
+        bg.blendingMode = .withinWindow
+        bg.wantsLayer = true
+        bg.layer?.cornerRadius = 12
+        bg.layer?.borderWidth = 0.5
+        bg.layer?.borderColor = NSColor.white.withAlphaComponent(0.15).cgColor
+        bg.appearance = NSAppearance(named: .vibrantDark)
+
+        func tool(_ title: String, _ sym: String, _ sel: Selector, _ tip: String, primary: Bool = false) -> NSView {
+            let b = CaptureBarButton(title: title, symbol: sym, primary: primary, target: self, action: sel)
+            b.toolTip = tip
+            return b
+        }
+        func sep() -> NSView {
+            let v = NSBox(); v.boxType = .separator
+            v.translatesAutoresizingMaskIntoConstraints = false
+            v.heightAnchor.constraint(equalToConstant: 36).isActive = true
+            return v
+        }
+        func field() -> NSTextField {
+            let f = NSTextField()
+            f.alignment = .center
+            f.font = .monospacedDigitSystemFont(ofSize: 12, weight: .medium)
+            f.bezelStyle = .roundedBezel
+            f.focusRingType = .none
+            f.delegate = self
+            f.target = self; f.action = #selector(sizeTyped(_:))
+            f.translatesAutoresizingMaskIntoConstraints = false
+            f.widthAnchor.constraint(equalToConstant: 58).isActive = true
+            let nf = NumberFormatter(); nf.allowsFloats = false; nf.minimum = 4; nf.maximum = 20000
+            f.formatter = nf
+            return f
+        }
+        let w = field(), h = field()
+        wField = w; hField = h
+        let times = NSTextField(labelWithString: "×")
+        times.textColor = .secondaryLabelColor
+        let sizeRow = NSStackView(views: [w, times, h])
+        sizeRow.spacing = 4
+        let sizeCaption = NSTextField(labelWithString: "Size (px)")
+        sizeCaption.font = .systemFont(ofSize: 10, weight: .medium)
+        sizeCaption.textColor = .secondaryLabelColor
+        let sizeBox = NSStackView(views: [sizeRow, sizeCaption])
+        sizeBox.orientation = .vertical
+        sizeBox.spacing = 3
+
+        let stack = NSStackView(views: [
+            tool("Capture", "camera.fill", #selector(doCapture), "Open in the editor (Return or double-click)", primary: true),
+            tool("Scrolling", "arrow.up.and.down.text.horizontal", #selector(doScroll), "Scroll and stitch everything below (S)"),
+            sep(),
+            tool("Copy", "doc.on.doc", #selector(doCopy), "Copy to clipboard, skip the editor (⌘C)"),
+            tool("Grab Text", "text.viewfinder", #selector(doText), "Copy the text in this area (T)"),
+            tool("Pin", "pin", #selector(doPin), "Float it above all windows (P)"),
+            sep(),
+            sizeBox,
+            sep(),
+            tool("Redo", "arrow.counterclockwise", #selector(doReselect), "Select again (Esc)"),
+            tool("Cancel", "xmark", #selector(doCancel), "Cancel capture"),
+        ])
+        stack.orientation = .horizontal
+        stack.alignment = .centerY
+        stack.spacing = 4
+        stack.edgeInsets = NSEdgeInsets(top: 6, left: 8, bottom: 6, right: 8)
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        bg.addSubview(stack)
+        NSLayoutConstraint.activate([
+            stack.leadingAnchor.constraint(equalTo: bg.leadingAnchor), stack.trailingAnchor.constraint(equalTo: bg.trailingAnchor),
+            stack.topAnchor.constraint(equalTo: bg.topAnchor), stack.bottomAnchor.constraint(equalTo: bg.bottomAnchor),
+        ])
+        addSubview(bg)
+        bg.setFrameSize(stack.fittingSize)
+        return bg
+    }
+
+    private var lastSize: CGSize = .zero
+    private func syncSizeFields(force: Bool = false) {
+        guard let wField, let hField else { return }
+        let sz = CGSize(width: (session.selection.width * scale).rounded(), height: (session.selection.height * scale).rounded())
+        guard force || sz != lastSize else { return }
+        lastSize = sz
+        if window?.firstResponder !== wField.currentEditor() { wField.integerValue = Int(sz.width) }
+        if window?.firstResponder !== hField.currentEditor() { hField.integerValue = Int(sz.height) }
+    }
+
+    @objc private func sizeTyped(_ s: Any?) {
+        guard let wField, let hField else { return }
+        session.applySize(width: CGFloat(wField.integerValue) / scale, height: CGFloat(hField.integerValue) / scale)
+        syncSizeFields(force: true)
+    }
+
+    func control(_ control: NSControl, textView: NSTextView, doCommandBy sel: Selector) -> Bool {
+        if sel == #selector(NSResponder.cancelOperation(_:)) { window?.makeFirstResponder(self); syncSizeFields(force: true); return true }
+        if sel == #selector(NSResponder.insertNewline(_:)) { sizeTyped(nil); window?.makeFirstResponder(self); return true }
+        return false
     }
 
     func positionToolbar() {
         guard let tb = toolbar, !tb.isHidden else { return }
         let f = local(session.selection)
         let sz = tb.frame.size
-        var x = f.maxX + 12
-        if x + sz.width > bounds.maxX - 8 { x = f.minX - sz.width - 12 }
-        if x < 8 { x = f.maxX - sz.width - 12 }
-        let y = min(max(8, f.minY), bounds.maxY - sz.height - 8)
+        var x = f.midX - sz.width / 2
+        x = min(max(8, x), bounds.maxX - sz.width - 8)
+        // Below the selection; above it if there's no room; inside the bottom edge as a last resort.
+        var y = f.maxY + 12
+        if y + sz.height > bounds.maxY - 8 { y = f.minY - sz.height - 12 }
+        if y < 8 { y = f.maxY - sz.height - 12 }
         tb.setFrameOrigin(CGPoint(x: x, y: y))
     }
 
     @objc func doCapture() { session.finish(.edit) }
+    @objc func doScroll() { session.finish(.scroll) }
     @objc func doCopy() { session.finish(.copy) }
     @objc func doText() { session.finish(.text) }
     @objc func doPin() { session.finish(.pin) }
     @objc func doCancel() { session.cancel() }
     @objc func doReselect() { session.reselect() }
+}
+
+/// Icon-over-label button used in the capture toolbar.
+final class CaptureBarButton: NSControl {
+    private let title: String
+    private let symbol: NSImage?
+    private let primary: Bool
+    private var hovering = false { didSet { needsDisplay = true } }
+    private var pressed = false { didSet { needsDisplay = true } }
+
+    init(title: String, symbol: String, primary: Bool, target: AnyObject, action: Selector) {
+        self.title = title
+        self.symbol = NSImage(systemSymbolName: symbol, accessibilityDescription: title)?
+            .withSymbolConfiguration(.init(pointSize: 17, weight: .medium))
+        self.primary = primary
+        super.init(frame: NSRect(x: 0, y: 0, width: 66, height: 52))
+        self.target = target; self.action = action
+        translatesAutoresizingMaskIntoConstraints = false
+        widthAnchor.constraint(equalToConstant: max(60, (title as NSString).size(withAttributes: [.font: NSFont.systemFont(ofSize: 11, weight: .medium)]).width + 18)).isActive = true
+        heightAnchor.constraint(equalToConstant: 52).isActive = true
+        setAccessibilityRole(.button); setAccessibilityLabel(title)
+    }
+    required init?(coder: NSCoder) { fatalError() }
+    override var isFlipped: Bool { true }
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+    override func updateTrackingAreas() {
+        trackingAreas.forEach(removeTrackingArea)
+        addTrackingArea(NSTrackingArea(rect: bounds, options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect], owner: self))
+    }
+    override func mouseEntered(with event: NSEvent) { hovering = true; NSCursor.arrow.set() }
+    override func mouseExited(with event: NSEvent) { hovering = false }
+    override func mouseDown(with event: NSEvent) { pressed = true }
+    override func mouseUp(with event: NSEvent) {
+        pressed = false
+        if bounds.contains(convert(event.locationInWindow, from: nil)), let action { NSApp.sendAction(action, to: target, from: self) }
+    }
+    override func draw(_ dirtyRect: NSRect) {
+        let r = bounds.insetBy(dx: 1, dy: 2)
+        let bgPath = NSBezierPath(roundedRect: r, xRadius: 8, yRadius: 8)
+        if primary { accent.withAlphaComponent(pressed ? 0.8 : 1).setFill(); bgPath.fill() }
+        else if hovering || pressed { NSColor.white.withAlphaComponent(pressed ? 0.22 : 0.12).setFill(); bgPath.fill() }
+        let fg = NSColor.white
+        if let img = symbol {
+            let tinted = NSImage(size: img.size, flipped: false) { rect in
+                img.draw(in: rect); fg.set(); rect.fill(using: .sourceAtop); return true
+            }
+            let box = CGRect(x: bounds.midX - 12, y: 7, width: 24, height: 22)
+            let k = min(box.width / img.size.width, box.height / img.size.height, 1)
+            let s = CGSize(width: img.size.width * k, height: img.size.height * k)
+            tinted.draw(in: CGRect(x: box.midX - s.width / 2, y: box.midY - s.height / 2, width: s.width, height: s.height))
+        }
+        let attrs: [NSAttributedString.Key: Any] = [.font: NSFont.systemFont(ofSize: 11, weight: primary ? .semibold : .medium), .foregroundColor: fg]
+        let ts = (title as NSString).size(withAttributes: attrs)
+        (title as NSString).draw(at: CGPoint(x: bounds.midX - ts.width / 2, y: 33), withAttributes: attrs)
+    }
 }

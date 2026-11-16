@@ -1,5 +1,7 @@
 import Cocoa
 import Vision
+import ScreenCaptureKit
+import AudioToolbox
 
 // MARK: - Grab Text (on-device OCR)
 
@@ -169,5 +171,132 @@ enum Toast {
             guard panel === p else { return }
             NSAnimationContext.runAnimationGroup({ $0.duration = 0.25; p.animator().alphaValue = 0 }, completionHandler: { p.orderOut(nil) })
         }
+    }
+}
+
+// MARK: - Timing (written to ~/Library/Logs/Snapmark.log)
+
+enum Perf {
+    static var marks: [String: CFAbsoluteTime] = [:]
+    static let logURL = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Logs/Snapmark.log")
+    static var lapT = CFAbsoluteTimeGetCurrent()
+    static func lap(_ name: String) { let n = CFAbsoluteTimeGetCurrent(); write(String(format: "  lap %@: %.1f ms", name, (n - lapT) * 1000)); lapT = n }
+    static func start(_ name: String) { marks[name] = CFAbsoluteTimeGetCurrent() }
+    @discardableResult
+    static func end(_ name: String, log: Bool = true) -> Double {
+        guard let t = marks.removeValue(forKey: name) else { return -1 }
+        let ms = (CFAbsoluteTimeGetCurrent() - t) * 1000
+        if log { write(String(format: "%@: %.1f ms", name, ms)) }
+        return ms
+    }
+    static func write(_ line: String) {
+        let s = "\(ISO8601DateFormatter().string(from: Date())) \(line)\n"
+        if let h = try? FileHandle(forWritingTo: logURL) { h.seekToEndOfFile(); h.write(s.data(using: .utf8)!); try? h.close() }
+        else { try? s.write(to: logURL, atomically: true, encoding: .utf8) }
+    }
+}
+
+// MARK: - Benchmark (--bench): runs capture cycles without user input and logs the numbers.
+
+enum Bench {
+    static var active = false
+    static var results: [String: [Double]] = [:]
+    static var runsLeft = 0
+    static var onOverlay: (() -> Void)?
+
+    static func run(cycles: Int = 5) {
+        active = true
+        runsLeft = cycles
+        Perf.write("---- bench start ----")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { next() }
+    }
+
+    static func record(_ k: String, _ v: Double) { results[k, default: []].append(v) }
+
+    static func next() {
+        guard runsLeft > 0 else { finish(); return }
+        runsLeft -= 1
+        onOverlay = {
+            guard let s = CaptureSession.current, let scr = NSScreen.main else { return }
+            // Simulate 200 mouse moves across the screen and time the hover/redraw work.
+            let r = Geo.cgRect(scr)
+            var total = 0.0
+            for i in 0..<200 {
+                let p = CGPoint(x: r.minX + CGFloat(i * 37 % Int(r.width)), y: r.minY + CGFloat(i * 23 % Int(r.height)))
+                let t = CFAbsoluteTimeGetCurrent()
+                s.mouse = p
+                s.updateHover()
+                CATransaction.flush()
+                total += (CFAbsoluteTimeGetCurrent() - t) * 1000
+            }
+            record("hover per move", total / 200)
+            s.selectionScreen = scr
+            s.selection = CGRect(x: r.midX - 400, y: r.midY - 300, width: 800, height: 600)
+            Perf.start("capture → editor visible")
+            s.finish(.edit)
+        }
+        AppDelegate.shared.capture(.region)
+    }
+
+    static func editorShown() {
+        let ms = Perf.end("capture → editor visible", log: false)
+        if ms >= 0 { record("capture → editor visible", ms) }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { next() }
+    }
+
+    static func finish() {
+        var lines = ["---- bench results (median of runs) ----"]
+        for (k, v) in results.sorted(by: { $0.key < $1.key }) {
+            let m = v.sorted()[v.count / 2]
+            lines.append(String(format: "%@: %.1f ms   (all: %@)", k, m, v.map { String(format: "%.0f", $0) }.joined(separator: ", ")))
+        }
+        lines.forEach(Perf.write)
+        print(lines.joined(separator: "\n"))
+        exit(0)
+    }
+}
+
+// MARK: - Screen grabbing (fast path + ScreenCaptureKit fallback)
+
+enum ScreenGrab {
+    private typealias Fn = @convention(c) (CGDirectDisplayID) -> Unmanaged<CGImage>?
+    /// CGDisplayCreateImage is hidden from the SDK but still ships in CoreGraphics and is ~4x faster
+    /// than SCScreenshotManager. If it ever disappears or fails, we fall back to ScreenCaptureKit.
+    private static let legacy: Fn? = {
+        guard let h = dlopen(nil, RTLD_NOW), let sym = dlsym(h, "CGDisplayCreateImage") else { return nil }
+        return unsafeBitCast(sym, to: Fn.self)
+    }()
+    private static var content: SCShareableContent?
+    /// System sounds play asynchronously; NSSound blocks the main thread for ~0.8 s the first time.
+    private static let soundID: SystemSoundID = {
+        var id: SystemSoundID = 0
+        AudioServicesCreateSystemSoundID(URL(fileURLWithPath: "/System/Library/Sounds/Tink.aiff") as CFURL, &id)
+        return id
+    }()
+    static func playShutter() { AudioServicesPlaySystemSound(soundID) }
+
+    /// Warm caches so the first capture doesn't pay for them.
+    static func prewarm() {
+        _ = soundID
+        refreshContent()
+        NotificationCenter.default.addObserver(forName: NSApplication.didChangeScreenParametersNotification, object: nil, queue: .main) { _ in refreshContent(); OverlayWindow.pool.removeAll() }
+    }
+    static func refreshContent() {
+        Task { content = try? await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true) }
+    }
+
+    struct Target: Sendable { let id: CGDirectDisplayID; let pixels: CGSize }
+
+    static func grab(_ t: Target) async throws -> CGImage {
+        if let f = legacy, let img = f(t.id)?.takeRetainedValue() { return img }
+        let c: SCShareableContent
+        if let cached = content { c = cached } else { c = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true); content = c }
+        guard let d = c.displays.first(where: { $0.displayID == t.id }) else { throw CocoaError(.featureUnsupported) }
+        let me = c.applications.filter { $0.processID == ProcessInfo.processInfo.processIdentifier }
+        let cfg = SCStreamConfiguration()
+        cfg.width = Int(t.pixels.width); cfg.height = Int(t.pixels.height)
+        cfg.showsCursor = false
+        cfg.captureResolution = .best
+        return try await SCScreenshotManager.captureImage(contentFilter: SCContentFilter(display: d, excludingApplications: me, exceptingWindows: []), configuration: cfg)
     }
 }

@@ -20,6 +20,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             AppIcon.writePNG(to: URL(fileURLWithPath: args[i + 1]))
             exit(0)
         }
+        if let i = args.firstIndex(of: "--test-stitch"), i + 2 < args.count {
+            StitchTest.run(input: URL(fileURLWithPath: args[i + 1]), output: URL(fileURLWithPath: args[i + 2]))
+            exit(0)
+        }
         if let i = args.firstIndex(of: "--selftest"), i + 2 < args.count {
             SelfTest.run(input: URL(fileURLWithPath: args[i + 1]), output: URL(fileURLWithPath: args[i + 2]))
             exit(0)
@@ -29,6 +33,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         buildStatusItem()
         registerHotKeys()
         Library.shared.reload()
+        ScreenGrab.prewarm()
+        prewarmEditor(after: 0.8)
 
         if let i = args.firstIndex(of: "--snapshot-editor"), i + 2 < args.count {
             // Debug: open an image in the editor and render the window to a PNG.
@@ -47,6 +53,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             return
         }
+        if let i = args.firstIndex(of: "--snapshot-overlay"), i + 2 < args.count {
+            CaptureSession.snapshot(input: URL(fileURLWithPath: args[i + 1]), output: URL(fileURLWithPath: args[i + 2])); return
+        }
+        if args.contains("--bench") { Bench.run(); return }
         if let i = args.firstIndex(of: "--open"), i + 1 < args.count {
             openEditor(URL(fileURLWithPath: args[i + 1]))
         } else {
@@ -200,12 +210,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: Capture
 
     func capture(_ mode: CaptureMode) {
+        Perf.start("hotkey → overlay visible")
         // If one of our own windows is in front (e.g. the Library button was clicked), get it out of the way first.
         var wait = Library.shared.delay ? 3.0 : 0.0
         if NSApp.isActive {
             // Like Snagit: our own windows get out of the way while you capture.
-            if let lib = libraryWindow, lib.isVisible, lib.isKeyWindow { lib.orderOut(nil); wait = max(wait, 0.25) }
-            if let w = editor?.window, w.isVisible { w.orderOut(nil); editorHiddenForCapture = true; wait = max(wait, 0.25) }
+            if let lib = libraryWindow, lib.isVisible, lib.isKeyWindow { lib.orderOut(nil); wait = max(wait, 0.03) }
+            if let w = editor?.window, w.isVisible { w.orderOut(nil); editorHiddenForCapture = true; wait = max(wait, 0.03) }
         }
         PermissionState.shared.refresh()
         if !PermissionState.shared.screenReady { PermissionsController.shared.show(.screen); return }
@@ -224,14 +235,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if let ed = editor {
             ed.load(url: url, extras: extras, preloaded: preloaded)
             ed.window?.makeKeyAndOrderFront(nil)
+            editorDidShow()
             return
         }
         guard let ec = EditorWindowController(url: url, extras: extras, preloaded: preloaded) else {
             let a = NSAlert(); a.messageText = "Couldn't open \(url.lastPathComponent)"; a.runModal(); return
         }
-        ec.onClose = { [weak self] in self?.editor = nil }
+        ec.onClose = { [weak self] in self?.editor = nil; self?.prewarmEditor(after: 1) }
         editor = ec
         ec.showWindow(nil)
+        editorDidShow()
+    }
+
+    private func editorDidShow() {
+        editor?.window?.displayIfNeeded()
+        CATransaction.flush()
+        if Bench.active { Bench.editorShown() } else { Perf.end("capture → editor visible") }
+    }
+
+    /// Build the editor window ahead of time (hidden) so the first capture opens instantly.
+    func prewarmEditor(after delay: Double) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+            guard let self, self.editor == nil,
+                  let ctx = CGContext(data: nil, width: 1, height: 1, bitsPerComponent: 8, bytesPerRow: 4, space: CGColorSpaceCreateDeviceRGB(),
+                                      bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue), let blank = ctx.makeImage(),
+                  let ec = EditorWindowController(url: FileManager.default.temporaryDirectory.appendingPathComponent("Snapmark.png"),
+                                                  preloaded: ImageDoc(base: blank, scale: 1)) else { return }
+            ec.onClose = { [weak self] in self?.editor = nil; self?.prewarmEditor(after: 1) }
+            self.editor = ec
+        }
     }
 
     /// Called when a capture is cancelled: bring back the editor if we hid it to capture.

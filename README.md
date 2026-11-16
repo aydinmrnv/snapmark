@@ -2,11 +2,13 @@
 
 A fast, free screenshot and markup tool for macOS, inspired by the Snagit workflow.
 
-> **Work in progress.** Capture works, but the capture screen is being rebuilt and scrolling capture is coming next.
+> Early release: expect rough edges, and please open an issue if something breaks.
 
 ## Features
 
-- **Smart capture** (⌃⇧1): hover to snap to windows, panels and buttons; drag for a custom region; arrows nudge, ⌥-arrows resize.
+- **Smart capture** (⌃⇧1): hover to snap to windows, panels and buttons (scroll to pick a bigger area), or drag a region. A magnifier shows exact pixels and color; the toolbar under the selection lets you type an exact size. Arrows nudge, ⌥-arrows resize.
+- **Scrolling capture** (S, or the Scrolling button): Snapmark scrolls the page and stitches it into one tall image, keeping sticky headers once. If an app ignores automatic scrolling, just scroll it yourself and press Done.
+- **Fast**: the capture screen appears in about 0.1 s and captures open in the editor in under 0.1 s.
 - **Window** (⌃⇧2) and **full screen** (⌃⇧3) capture, plus a 3-second delay.
 - **Editor**: arrow, text, callout, shapes, numbered steps, highlight, blur, pixelate, redact, spotlight, magnify, stamps, crop, color picker.
 - **Hide or show the mouse cursor** after capture.

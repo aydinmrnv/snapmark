@@ -1148,7 +1148,7 @@ final class TrayItem: NSButton {
         super.init(frame: .zero)
         self.target = target; self.action = action
         isBordered = false; title = ""
-        image = Library.shared.thumbnail(url)
+        Library.shared.thumbnail(url) { [weak self] img in self?.image = img; self?.needsDisplay = true }
         imageScaling = .scaleProportionallyUpOrDown
         toolTip = url.deletingPathExtension().lastPathComponent
         translatesAutoresizingMaskIntoConstraints = false
@@ -1242,7 +1242,16 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate {
     /// Show a capture in this window (saving whatever was open before).
     func load(url newURL: URL, extras: [Annotation] = [], preloaded: ImageDoc? = nil) {
         if url == newURL, extras.isEmpty, preloaded == nil { return }
-        if url != nil { canvas.commitText(); if dirty { save() } }
+        if url != nil {
+            canvas.commitText()
+            // Save the previous capture in the background so switching is instant.
+            if dirty, let prevDoc = doc, let prevURL = url {
+                DispatchQueue.global(qos: .utility).async {
+                    if let cg = Renderer.flatten(prevDoc) { Renderer.write(cg, to: prevURL, type: .png, scale: prevDoc.scale) }
+                    DispatchQueue.main.async { Library.shared.reload() }
+                }
+            }
+        }
         guard let d = preloaded ?? ImageDoc(url: newURL) else { NSSound.beep(); return }
         d.items.append(contentsOf: extras)
         url = newURL
@@ -1623,6 +1632,12 @@ final class EditorWindowController: NSWindowController, NSWindowDelegate {
 
     func rebuildTray() {
         guard trayStack != nil else { return }
+        let want = Array(Library.shared.items.prefix(60))
+        let have = trayStack.arrangedSubviews.compactMap { ($0 as? TrayItem)?.fileURL }
+        if want == have {
+            for case let t as TrayItem in trayStack.arrangedSubviews { t.isCurrent = t.fileURL == url }
+            return
+        }
         trayStack.arrangedSubviews.forEach { $0.removeFromSuperview() }
         for u in Library.shared.items.prefix(60) {
             let item = TrayItem(url: u, target: self, action: #selector(trayClicked(_:)))
