@@ -1,0 +1,4 @@
+build/
+Snapmark.app/
+*.backup.swift
+.DS_Store
